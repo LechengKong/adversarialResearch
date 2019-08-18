@@ -11,7 +11,7 @@ import numpy as np
 import util
 tf.random.set_random_seed(87)
 
-dir_head = tf.constant("../JPEGImagesBB12930/")
+dir_head = tf.constant("../JPEGImagesBBin/")
 filenames = tf.placeholder(tf.string, shape=[None])
 resample_portion = 0.5
 train_set_size = 5717

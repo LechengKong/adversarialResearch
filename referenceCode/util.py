@@ -1,5 +1,6 @@
 import tensorflow as tf
 from tensorflow.keras.applications.vgg16 import preprocess_input
+from tensorflow import keras
 import imageio
 import random
 import math
@@ -25,22 +26,25 @@ def iou_metric(y_true, y_pred):
     intersect = intersect_x * intersect_y
     union = (y_true_t[1] - y_true_t[0]) * (y_true_t[3] - y_true_t[2]) + (tf.abs(y_pred_t[1] - y_pred_t[0])) * (tf.abs(y_pred_t[3] - y_pred_t[2])) - intersect
     iou = intersect/union
-    return tf.reduce_mean(iou)
+    return iou
 
 def iou_acc_metric(y_true, y_pred):
-    y_true_t = tf.transpose(y_true)
-    y_pred_t = tf.transpose(y_pred)
-    intersect_xmin = tf.maximum(y_true_t[0], y_pred_t[0])
-    intersect_xmax = tf.minimum(y_true_t[1], y_pred_t[1])
-    intersect_ymin = tf.maximum(y_true_t[2], y_pred_t[2])
-    intersect_ymax = tf.minimum(y_true_t[3], y_pred_t[3])
-    intersect_x = tf.maximum(intersect_xmax - intersect_xmin, 0)
-    intersect_y = tf.maximum(intersect_ymax - intersect_ymin, 0)
-    intersect = intersect_x * intersect_y
-    union = (y_true_t[1] - y_true_t[0]) * (y_true_t[3] - y_true_t[2]) + (tf.abs(y_pred_t[1] - y_pred_t[0])) * (tf.abs(y_pred_t[3] - y_pred_t[2])) - intersect
-    iou = intersect/union
+    iou = iou_metric(y_true, y_pred)
     acc = tf.clip_by_value(tf.sign(iou - 0.5), 0, 1)
-    return tf.reduce_mean(acc)
+    return acc
+
+def joint_acc_metric(y_true, y_pred):
+    y_cla_pred, y_reg_pred = tf.split(y_pred, [20, 4], 1)
+    y_cla_true, y_reg_true = tf.split(y_true, [1, 4], 1)
+    y_cla_true = tf.squeeze(y_cla_true, -1)
+    y_label_pred = tf.argmax(y_cla_pred, axis = -1)
+    cla_acc = tf.equal(y_cla_true, tf.to_float(y_label_pred))
+    iou = iou_metric(y_reg_true, y_reg_pred)
+    reg_acc = tf.greater(iou, 0.5)
+    return tf.cast(tf.logical_and(cla_acc, reg_acc), tf.float64)
+
+def naive_loss(y_true, y_pred):
+    return tf.constant(1.0)
 
 def parse_function_generator(dir_head):
     def parse_function(example_proto):
@@ -116,6 +120,92 @@ def reg_parse_function_generator(dir_head):
         #label = tf.cast(parsed_features["image/object/class/label"], tf.float32)
         #label = tf.cast(tf.reshape(parsed_features["image/object/class/label"], shape=[]), dtype=tf.int32)
         return {'vgg16_input':image}, [nxmin, nxmax, nymin, nymax]
+    return parse_function
+
+def cla_reg_function_generator(dir_head):
+    def parse_function(example_proto):
+        feature={
+        'image/height': tf.FixedLenFeature((), tf.int64, -1),
+        'image/width': tf.FixedLenFeature((), tf.int64, -1),
+        'image/filename': tf.FixedLenFeature((), tf.string, default_value=''),
+        'image/source_id': tf.FixedLenFeature((), tf.string, default_value=''),
+        'image/key/sha256': tf.FixedLenFeature((), tf.string, default_value=''),
+        'image/encoded': tf.FixedLenFeature((), tf.string, default_value=''),
+        'image/format': tf.FixedLenFeature((), tf.string, default_value='jpeg'),
+        'image/object/bbox/xmin': tf.VarLenFeature(dtype=tf.float32),
+        'image/object/bbox/xmax': tf.VarLenFeature(dtype=tf.float32),
+        'image/object/bbox/ymin': tf.VarLenFeature(dtype=tf.float32),
+        'image/object/bbox/ymax': tf.VarLenFeature(dtype=tf.float32),
+        'image/object/class/text': tf.VarLenFeature(tf.string),
+        'image/object/class/label': tf.VarLenFeature(tf.int64),
+        'image/object/difficult': tf.VarLenFeature(tf.int64),
+        }
+        parsed_features = tf.parse_single_example(example_proto, feature)
+        file = tf.string_join([dir_head, parsed_features["image/filename"]])
+        x = parsed_features['image/object/bbox/xmax'].values-parsed_features['image/object/bbox/xmin'].values
+        y = parsed_features['image/object/bbox/ymax'].values-parsed_features['image/object/bbox/ymin'].values
+        area = tf.math.multiply(x,y)
+        index = tf.math.argmax(area)
+        image_string = tf.read_file(file)
+        image = tf.image.decode_image(image_string, channels=3,dtype=tf.uint8)
+        image.set_shape([None, None, None])
+        fwidth = tf.to_float(parsed_features["image/width"])
+        fheight = tf.to_float(parsed_features["image/height"])
+        hgap = (500-fwidth)/2
+        vgap = (500-fheight)/2
+        nxmin = (parsed_features["image/object/bbox/xmin"].values[index]*fwidth + hgap)/500.0
+        nxmax = (parsed_features["image/object/bbox/xmax"].values[index]*fwidth + hgap)/500.0
+        nymin = (parsed_features["image/object/bbox/ymin"].values[index]*fheight + vgap)/500.0
+        nymax = (parsed_features["image/object/bbox/ymax"].values[index]*fheight + vgap)/500.0
+        image = tf.image.resize_image_with_crop_or_pad(image, 500, 500)
+        image = preprocess_input(image)
+        #label = tf.cast(parsed_features["image/object/class/label"], tf.float32)
+        #label = tf.cast(tf.reshape(parsed_features["image/object/class/label"], shape=[]), dtype=tf.int32)
+        return {'vgg16_input':image}, {'classification_output' : [parsed_features["image/object/class/label"].values[index]-1],
+                                       'regression_output' : [nxmin, nxmax, nymin, nymax]}
+    return parse_function
+
+def joint_parse_function_generator(dir_head):
+    def parse_function(example_proto):
+        feature={
+        'image/height': tf.FixedLenFeature((), tf.int64, -1),
+        'image/width': tf.FixedLenFeature((), tf.int64, -1),
+        'image/filename': tf.FixedLenFeature((), tf.string, default_value=''),
+        'image/source_id': tf.FixedLenFeature((), tf.string, default_value=''),
+        'image/key/sha256': tf.FixedLenFeature((), tf.string, default_value=''),
+        'image/encoded': tf.FixedLenFeature((), tf.string, default_value=''),
+        'image/format': tf.FixedLenFeature((), tf.string, default_value='jpeg'),
+        'image/object/bbox/xmin': tf.VarLenFeature(dtype=tf.float32),
+        'image/object/bbox/xmax': tf.VarLenFeature(dtype=tf.float32),
+        'image/object/bbox/ymin': tf.VarLenFeature(dtype=tf.float32),
+        'image/object/bbox/ymax': tf.VarLenFeature(dtype=tf.float32),
+        'image/object/class/text': tf.VarLenFeature(tf.string),
+        'image/object/class/label': tf.VarLenFeature(tf.int64),
+        'image/object/difficult': tf.VarLenFeature(tf.int64),
+        }
+        parsed_features = tf.parse_single_example(example_proto, feature)
+        file = tf.string_join([dir_head, parsed_features["image/filename"]])
+        x = parsed_features['image/object/bbox/xmax'].values-parsed_features['image/object/bbox/xmin'].values
+        y = parsed_features['image/object/bbox/ymax'].values-parsed_features['image/object/bbox/ymin'].values
+        area = tf.math.multiply(x,y)
+        index = tf.math.argmax(area)
+        image_string = tf.read_file(file)
+        image = tf.image.decode_image(image_string, channels=3,dtype=tf.uint8)
+        image.set_shape([None, None, None])
+        fwidth = tf.to_float(parsed_features["image/width"])
+        fheight = tf.to_float(parsed_features["image/height"])
+        hgap = (500-fwidth)/2
+        vgap = (500-fheight)/2
+        nxmin = (parsed_features["image/object/bbox/xmin"].values[index]*fwidth + hgap)/500.0
+        nxmax = (parsed_features["image/object/bbox/xmax"].values[index]*fwidth + hgap)/500.0
+        nymin = (parsed_features["image/object/bbox/ymin"].values[index]*fheight + vgap)/500.0
+        nymax = (parsed_features["image/object/bbox/ymax"].values[index]*fheight + vgap)/500.0
+        image = tf.image.resize_image_with_crop_or_pad(image, 500, 500)
+        image = preprocess_input(image)
+        #label = tf.cast(parsed_features["image/object/class/label"], tf.float32)
+        #label = tf.cast(tf.reshape(parsed_features["image/object/class/label"], shape=[]), dtype=tf.int32)
+        return {'vgg16_input':image}, {'joint_output' : [tf.to_float(parsed_features["image/object/class/label"].values[index]-1),
+                                                            nxmin, nxmax, nymin, nymax]}
     return parse_function
 
 def fileset_repartition(dataset_dirs, size, new_trainset_filename, new_testset_filename,train_portion = 0.75, seed = None):
@@ -233,13 +323,28 @@ def add_black_box(original_box, image_size, box_size, random_seed = None):
             y = random.random() * (image_size[0] - box_h)
     return int(x), int(y), box_w, box_h
 
-def draw_black_box(filename, original_box, input_dir, output_dir, box_area):
+def add_black_box_in_bound(original_box, image_size, box_size, random_seed = None):
+    inbound_xmin = int(original_box[0] * image_size[1])
+    inbound_ymin = int(original_box[2] * image_size[0])
+    inbound_xmax = int(original_box[1] * image_size[1])
+    inbound_ymax = int(original_box[3] * image_size[0])
+    inbound_x = inbound_xmax - inbound_xmin
+    inbound_y = inbound_ymax - inbound_ymin
+    box_w = int(math.ceil(max(random.random()*inbound_x, box_size / inbound_y)))
+    box_h = int(box_size/box_w)
+    if box_h > inbound_y:
+        return None
+    x = random.random() * (inbound_xmax - inbound_xmin) + inbound_xmin
+    y = random.random() * (inbound_xmax - inbound_xmin) + inbound_ymin
+    return int(x), int(y), box_w, box_h
+
+def draw_black_box(filename, generate_box, original_box, input_dir, output_dir, box_area):
     img = imageio.imread(input_dir + filename)
     img_shape = np.shape(img)
-    black_box = add_black_box(original_box, img_shape, box_area)
+    black_box = generate_box(original_box, img_shape, box_area)
     retrial = 10
     while black_box == None and retrial > 0:
-        black_box = add_black_box(original_box, img_shape, box_area)
+        black_box = generate_box(original_box, img_shape, box_area)
         retrial -= 1
     if retrial == 0:
         imageio.imsave(output_dir + filename, img)

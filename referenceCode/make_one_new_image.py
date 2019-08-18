@@ -2,7 +2,7 @@ import util
 import os
 import tensorflow as tf
 input_dir = "../JPEGImages/"
-output_dir = "../JPEGImagesBB1000/"
+output_dir = "../JPEGImagesBBin/"
 filenames = ["./pascal_train_and_half_val.record", "./pascal_half_val.record"]
 
 try:
@@ -54,7 +54,7 @@ with tf.Session() as sess:
         while True:
             act_val = sess.run(val)
             for i, file in enumerate(act_val[0]):
-                total_area += util.draw_black_box(file.decode("utf-8") , act_val[1][i], input_dir, output_dir, 15000)
+                total_area += util.draw_black_box(file.decode("utf-8"), util.add_black_box_in_bound, act_val[1][i], input_dir, output_dir, 5000)
                 count+=1
     except tf.errors.OutOfRangeError:
         pass
